@@ -12,29 +12,18 @@ logging.config.fileConfig('logging.conf')
 logging.getLogger().setLevel(logging.INFO)
 logging.getLogger("pyrogram").setLevel(logging.ERROR)
 
-def _is_session_string(value: str) -> bool:
-    return len(value) > 100
-
-
 class Bot(Client): 
     def __init__(self):
-        session_value = Config.BOT_SESSION
-        kwargs = dict(
+        super().__init__(
+            Config.BOT_SESSION,
             api_hash=Config.API_HASH,
             api_id=Config.API_ID,
-            plugins={"root": "plugins"},
+            plugins={
+                "root": "plugins"
+            },
             workers=50,
-            bot_token=Config.BOT_TOKEN,
+            bot_token=Config.BOT_TOKEN
         )
-        if _is_session_string(session_value):
-            super().__init__(
-                "bot",
-                session_string=session_value,
-                in_memory=True,
-                **kwargs,
-            )
-        else:
-            super().__init__(session_value, **kwargs)
         self.log = logging
 
     async def start(self):
