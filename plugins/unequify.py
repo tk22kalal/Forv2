@@ -4,7 +4,6 @@ from config import temp
 from .test import CLIENT , start_clone_bot
 from translation import Translation
 from pyrogram import Client, filters 
-#from pyropatch.utils import unpack_new_file_id
 from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 CLIENT = CLIENT()
@@ -38,7 +37,7 @@ async def unequify(client, message):
       last_msg_id = int(match.group(5))
       if chat_id.isnumeric():
          chat_id  = int(("-100" + chat_id))
-   elif fromid.forward_from_chat.type in ['channel', 'supergroup']:
+   elif target.forward_from_chat and target.forward_from_chat.type in ['channel', 'supergroup']:
         last_msg_id = target.forward_from_message_id
         chat_id = target.forward_from_chat.username or target.forward_from_chat.id
    else:
@@ -68,7 +67,7 @@ async def unequify(client, message):
            await sts.edit(Translation.DUPLICATE_TEXT.format(total, deleted, "ᴄᴀɴᴄᴇʟʟᴇᴅ"), reply_markup=COMPLETED_BTN)
            return await bot.stop()
         file = message.document
-        file_id = unpack_new_file_id(file.file_id) 
+        file_id = file.file_unique_id
         if file_id in MESSAGES:
            DUPLICATE.append(message.id)
         else:
