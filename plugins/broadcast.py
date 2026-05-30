@@ -42,7 +42,7 @@ async def broadcast_messages(user_id, message, log):
         await message.copy(chat_id=user_id)
         return True, "Success"
     except FloodWait as e:
-        await asyncio.sleep(e.x)
+        await asyncio.sleep(e.value)
         return await broadcast_messages(user_id, message, log)
     except InputUserDeactivated:
         await db.delete_user(int(user_id))
