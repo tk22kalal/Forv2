@@ -12,29 +12,19 @@ logging.config.fileConfig('logging.conf')
 logging.getLogger().setLevel(logging.INFO)
 logging.getLogger("pyrogram").setLevel(logging.ERROR)
 
-def _is_session_string(value: str) -> bool:
-    return len(value) > 100
-
 
 class Bot(Client): 
     def __init__(self):
-        session_value = Config.BOT_SESSION
-        kwargs = dict(
+        session_name = Config.BOT_SESSION if len(Config.BOT_SESSION) <= 100 else "bot"
+        super().__init__(
+            session_name,
             api_hash=Config.API_HASH,
             api_id=Config.API_ID,
             plugins={"root": "plugins"},
             workers=50,
             bot_token=Config.BOT_TOKEN,
+            in_memory=True,
         )
-        if _is_session_string(session_value):
-            super().__init__(
-                "bot",
-                session_string=session_value,
-                in_memory=True,
-                **kwargs,
-            )
-        else:
-            super().__init__(session_value, **kwargs)
         self.log = logging
 
     async def start(self):
@@ -44,8 +34,8 @@ class Bot(Client):
         self.id = me.id
         self.username = me.username
         self.first_name = me.first_name
-        self.set_parse_mode(ParseMode.DEFAULT)
-        text = "**๏[-ิ_•ิ]๏ bot restarted !**"
+        self.set_parse_mode(ParseMode.HTML)
+        text = "<b>๏[-ิ_•ิ]๏ bot restarted !</b>"
         logging.info(text)
         success = failed = 0
         users = await db.get_all_frwd()
@@ -60,11 +50,10 @@ class Bot(Client):
               success += 1
            except Exception:
               failed += 1 
-    #    await self.send_message("venombotsupport", text)
         if (success + failed) != 0:
            await db.rmve_frwd(all=True)
-           logging.info(f"Restart message status"
-                 f"success: {success}"
+           logging.info(f"Restart message status "
+                 f"success: {success} "
                  f"failed: {failed}")
 
     async def stop(self, *args):
