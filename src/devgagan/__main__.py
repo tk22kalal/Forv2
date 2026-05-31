@@ -16,12 +16,14 @@ USER_SESSION = os.environ.get("USER_SESSION")
 
 async def run_userbot():
     if not USER_SESSION:
-        logger.info("USER_SESSION not set. Userbot (devgagan2) will not start.")
-        return
+        logger.info("USER_SESSION not set. Userbot (devgagan2) is idle.")
+        while True:
+            await asyncio.sleep(3600)
 
     if not API_ID or not API_HASH:
-        logger.error("API_ID or API_HASH not set. Cannot start userbot.")
-        return
+        logger.error("API_ID or API_HASH not set. Cannot start userbot. Idling.")
+        while True:
+            await asyncio.sleep(3600)
 
     try:
         from pyrogram import Client, idle
@@ -43,4 +45,3 @@ async def run_userbot():
 
 if __name__ == "__main__":
     asyncio.run(run_userbot())
-
