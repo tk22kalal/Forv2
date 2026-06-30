@@ -57,7 +57,7 @@ async def pub_(bot, message):
     await db.add_frwd(user)
     await send(client, user, "<b>ғᴏʀᴡᴀʀᴅɪɴɢ sᴛᴀʀᴛᴇᴅ <a href=https://t.me/dev_gagan>Dev Gagan</a></b>")
     sts.add(time=True)
-    sleep = 1 if _bot['is_bot'] else 10
+    sleep = 0.5 if _bot['is_bot'] else 3
     await msg_edit(m, "<code>Processing...</code>") 
     temp.IS_FRWD_CHAT.append(i.TO)
     temp.lock[user] = locked = True
@@ -88,15 +88,14 @@ async def pub_(bot, message):
                 if message.empty or message.service:
                    sts.add('deleted')
                    continue
-                if forward_tag:
+                if not caption:
                    MSG.append(message.id)
                    notcompleted = len(MSG)
                    completed = sts.get('total') - sts.get('fetched')
-                   if ( notcompleted >= 100 
-                        or completed <= 100): 
-                      await forward(client, MSG, m, sts, protect)
+                   if (notcompleted >= 100 or completed <= 100):
+                      await forward(client, MSG, m, sts, protect, drop_author=not forward_tag)
                       sts.add('total_files', notcompleted)
-                      await asyncio.sleep(10)
+                      await asyncio.sleep(3)
                       MSG = []
                 else:
                    new_caption = custom_caption(message, caption)
@@ -139,18 +138,19 @@ async def copy(bot, msg, m, sts):
      print(e)
      sts.add('deleted')
         
-async def forward(bot, msg, m, sts, protect):
-   try:                             
+async def forward(bot, msg, m, sts, protect, drop_author=False):
+   try:
      await bot.forward_messages(
            chat_id=sts.get('TO'),
-           from_chat_id=sts.get('FROM'), 
+           from_chat_id=sts.get('FROM'),
            protect_content=protect,
-           message_ids=msg)
+           message_ids=msg,
+           drop_author=drop_author)
    except FloodWait as e:
      await edit(m, 'Progressing', e.value, sts)
      await asyncio.sleep(e.value)
      await edit(m, 'Progressing', 10, sts)
-     await forward(bot, msg, m, sts, protect)
+     await forward(bot, msg, m, sts, protect, drop_author)
 
 PROGRESS = """
 📈 Percetage: {0} %
