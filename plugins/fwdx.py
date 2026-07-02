@@ -1,12 +1,14 @@
+import os
 import asyncio
 import logging
+import tempfile
 
 from database import db
 from config import temp
-from .test import CLIENT, start_clone_bot
+from .test import CLIENT, start_clone_bot, parse_buttons
 from .utils import STS
-from .topics import parse_fbatch_report
-from .regix import forward, copy, custom_caption, media, msg_edit, TimeFormatter
+from .topics import parse_fbatch_report, get_topic_id, raw_chat
+from .regix import custom_caption, media
 from pyrogram import Client, filters
 from pyrogram.errors import FloodWait
 from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton, ReplyKeyboardMarkup, ReplyKeyboardRemove
@@ -15,6 +17,13 @@ logger = logging.getLogger(__name__)
 CLIENT = CLIENT()
 
 _CHUNK = 190
+
+
+def _target_link(toid, msg_id):
+    rc = raw_chat(toid)
+    if isinstance(toid, int):
+        return f"https://t.me/c/{rc}/{msg_id}"
+    return f"https://t.me/{rc}/{msg_id}"
 
 
 async def _get_report_text(bot, message):
@@ -41,7 +50,6 @@ async def _get_report_text(bot, message):
             with open(path, "r", encoding="utf-8", errors="ignore") as f:
                 return f.read()
         finally:
-            import os
             if os.path.exists(path):
                 os.remove(path)
 
@@ -106,7 +114,7 @@ async def fwdx_command(bot, message):
 
     confirm = await message.reply_text(
         f"<b>❪ CONFIRM FORWARD ❫</b>\n\n"
-        f"<b>Topics:</b> {len(jobs)}\n"
+        f"<b>Topics:</b> {len(jobs)} (forwarded one at a time, in order)\n"
         f"<b>Total messages to scan:</b> {total_ids}\n\n"
         f"{summary}\n\n"
         f"<b>Start forwarding these topics to your target chat?</b>",
@@ -152,14 +160,10 @@ async def fwdx_confirm(bot, query):
         return await _stop(client, user_id)
 
     jobs = data["jobs"]
-    sts = STS(f"fwdx-{user_id}")
-    sts.store(None, toid, 0, sum(j["last"] - j["first"] + 1 for j in jobs))
-
     configs = await db.get_configs(user_id)
     caption = configs["caption"]
     forward_tag = configs["forward_tag"]
     protect = configs["protect"]
-    from .test import parse_buttons
     button = parse_buttons(configs["button"] if configs["button"] else "")
 
     temp.forwardings += 1
@@ -168,25 +172,47 @@ async def fwdx_confirm(bot, query):
     temp.lock[user_id] = True
 
     sleep = 0.5 if _bot["is_bot"] else 3
-    fetched = total_files = deleted = 0
+    fetched = total_files = deleted = skipped_other_topic = 0
+    topic_results = []  # list of (name, first_target_id, last_target_id)
+
+    async def _progress(j_idx, name, first, last):
+        try:
+            await m.edit(
+                f"<b>Forwarding topic {j_idx + 1}/{len(jobs)}:</b> {name}\n"
+                f"<code>{first}</code> → <code>{last}</code>\n\n"
+                f"Fetched: {fetched} | Forwarded: {total_files} | Skipped(other topic): {skipped_other_topic} | Deleted: {deleted}"
+            )
+        except Exception:
+            pass
 
     try:
         for j_idx, job in enumerate(jobs):
             chat_ref = job["chat_ref"]
+            topic_id = job["topic_id"]
             first, last = job["first"], job["last"]
-            name = job["name"] or f"Topic {job['topic_id']}"
-            sts.data[sts.id]["FROM"] = chat_ref
+            name = job["name"] or f"Topic {topic_id}"
 
-            try:
-                await m.edit(
-                    f"<b>Forwarding topic {j_idx + 1}/{len(jobs)}:</b> {name}\n"
-                    f"<code>{first}</code> → <code>{last}</code>\n\n"
-                    f"Fetched: {fetched} | Forwarded: {total_files} | Deleted: {deleted}"
-                )
-            except Exception:
-                pass
+            await _progress(j_idx, name, first, last)
 
             MSG = []
+            topic_first_target = None
+            topic_last_target = None
+
+            async def _flush_batch():
+                nonlocal total_files, topic_first_target, topic_last_target
+                if not MSG:
+                    return
+                sent = await _send_batch(client, MSG, chat_ref, toid, protect, drop_author=not forward_tag)
+                if sent:
+                    ids = [s.id for s in sent if s is not None]
+                    if ids:
+                        if topic_first_target is None:
+                            topic_first_target = ids[0]
+                        topic_last_target = ids[-1]
+                total_files += len(MSG)
+                MSG.clear()
+                await asyncio.sleep(3)
+
             for chunk_start in range(first, last + 1, _CHUNK):
                 if temp.CANCEL.get(user_id) is True:
                     raise asyncio.CancelledError("cancelled by user")
@@ -210,16 +236,16 @@ async def fwdx_confirm(bot, query):
                         continue
                     if getattr(msg, "forum_topic_created", None) is not None:
                         continue
+                    if topic_id is not None and get_topic_id(msg) != topic_id:
+                        skipped_other_topic += 1
+                        continue
                     if not msg.media:
                         continue
 
                     if not caption:
                         MSG.append(msg.id)
                         if len(MSG) >= 100:
-                            await forward(client, MSG, m, sts, protect, drop_author=not forward_tag)
-                            total_files += len(MSG)
-                            MSG = []
-                            await asyncio.sleep(3)
+                            await _flush_batch()
                     else:
                         details = {
                             "msg_id": msg.id,
@@ -228,26 +254,20 @@ async def fwdx_confirm(bot, query):
                             "button": button,
                             "protect": protect,
                         }
-                        details["from_chat"] = chat_ref
-                        await _copy_from(client, chat_ref, details, m, sts, toid)
+                        sent_msg = await _send_single(client, chat_ref, toid, details)
+                        if sent_msg is not None:
+                            if topic_first_target is None:
+                                topic_first_target = sent_msg.id
+                            topic_last_target = sent_msg.id
                         total_files += 1
                         await asyncio.sleep(sleep)
 
-                try:
-                    await m.edit(
-                        f"<b>Forwarding topic {j_idx + 1}/{len(jobs)}:</b> {name}\n"
-                        f"<code>{first}</code> → <code>{last}</code>\n\n"
-                        f"Fetched: {fetched} | Forwarded: {total_files} | Deleted: {deleted}"
-                    )
-                except Exception:
-                    pass
+                await _progress(j_idx, name, first, last)
                 await asyncio.sleep(0.35)
 
-            if MSG:
-                await forward(client, MSG, m, sts, protect, drop_author=not forward_tag)
-                total_files += len(MSG)
-                MSG = []
-                await asyncio.sleep(3)
+            await _flush_batch()
+
+            topic_results.append((name, topic_first_target, topic_last_target))
 
     except asyncio.CancelledError:
         try:
@@ -275,33 +295,90 @@ async def fwdx_confirm(bot, query):
         )
     except Exception:
         pass
+
+    await _send_report(bot, query.message.chat.id, user_id, toid, topic_results)
     await _stop(client, user_id, toid)
 
 
-async def _copy_from(bot, from_chat, details, m, sts, toid):
+async def _send_batch(bot, msg_ids, from_chat, to_chat, protect, drop_author=False):
+    try:
+        result = await bot.forward_messages(
+            chat_id=to_chat,
+            from_chat_id=from_chat,
+            protect_content=protect,
+            message_ids=msg_ids,
+            drop_author=drop_author,
+        )
+        return result if isinstance(result, list) else [result]
+    except FloodWait as e:
+        await asyncio.sleep(e.value)
+        return await _send_batch(bot, msg_ids, from_chat, to_chat, protect, drop_author)
+    except Exception as e:
+        logger.warning(f"fwdx forward error: {e}")
+        return []
+
+
+async def _send_single(bot, from_chat, to_chat, details):
     try:
         if details.get("media") and details.get("caption"):
-            await bot.send_cached_media(
-                chat_id=toid,
+            return await bot.send_cached_media(
+                chat_id=to_chat,
                 file_id=details["media"],
                 caption=details["caption"],
                 reply_markup=details["button"],
                 protect_content=details["protect"],
             )
-        else:
-            await bot.copy_message(
-                chat_id=toid,
-                from_chat_id=from_chat,
-                caption=details.get("caption"),
-                message_id=details["msg_id"],
-                reply_markup=details["button"],
-                protect_content=details["protect"],
-            )
+        return await bot.copy_message(
+            chat_id=to_chat,
+            from_chat_id=from_chat,
+            caption=details.get("caption"),
+            message_id=details["msg_id"],
+            reply_markup=details["button"],
+            protect_content=details["protect"],
+        )
     except FloodWait as e:
         await asyncio.sleep(e.value)
-        await _copy_from(bot, from_chat, details, m, sts, toid)
+        return await _send_single(bot, from_chat, to_chat, details)
     except Exception as e:
         logger.warning(f"fwdx copy error: {e}")
+        return None
+
+
+async def _send_report(bot, chat_id, user_id, toid, topic_results):
+    lines = []
+    for name, first_id, last_id in topic_results:
+        if first_id is None or last_id is None:
+            lines.append(f"{name}\nNo files forwarded (topic may have had no media).\n")
+            continue
+        lines.append(
+            f"{name}\n"
+            f"F - {_target_link(toid, first_id)}\n"
+            f"L - {_target_link(toid, last_id)}\n"
+        )
+
+    if not lines:
+        return
+
+    txt_content = "\n".join(lines)
+    tmp_path = None
+    try:
+        fd, tmp_path = tempfile.mkstemp(suffix=".txt", prefix=f"fwdx_{user_id}_")
+        os.close(fd)
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            f.write(txt_content)
+        await bot.send_document(
+            chat_id,
+            tmp_path,
+            caption="✅ <b>Target chat topic links</b>",
+        )
+    except Exception as e:
+        logger.error(f"fwdx send_report: {e}")
+    finally:
+        if tmp_path and os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except Exception:
+                pass
 
 
 async def _stop(client, user_id, toid=None):
@@ -314,4 +391,3 @@ async def _stop(client, user_id, toid=None):
     temp.lock[user_id] = False
     if toid is not None and toid in temp.IS_FRWD_CHAT:
         temp.IS_FRWD_CHAT.remove(toid)
-
