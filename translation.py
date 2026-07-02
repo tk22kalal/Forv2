@@ -15,6 +15,8 @@ class Translation(object):
 <u>**📚 Available commands:**</u>
 <b>⏣ __/start - check I'm alive__ 
 ⏣ __/forward - forward messages__
+⏣ __/fbatch - scan a forum supergroup and list its topics with first/last message links__
+⏣ __/fwdx - forward files from the topics listed by /fbatch to your target chat__
 ⏣ __/unequify - delete duplicate messages in channels__
 ⏣ __/settings - configure your settings__
 ⏣ __/reset - reset your settings__</b>
