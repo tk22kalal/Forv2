@@ -1,4 +1,3 @@
-import re
 import asyncio
 import logging
 
@@ -21,54 +20,83 @@ CLIENT = CLIENT()
 
 _CHUNK = 190
 
-# Matches: https://t.me/username/123  or  https://t.me/c/1234567890/123
-_TG_LINK_RE = re.compile(
-    r"https?://t\.me/(?:c/(-?\d+)|([A-Za-z0-9_]{4,}))/(\d+)"
-)
 
+def _extract_forward_info(msg):
+    """
+    Extract (chat_ref, msg_id, error_text) from a forwarded message.
 
-def _parse_msg_link(text):
+    chat_ref — username (str) or numeric id (int) of the source chat.
+    msg_id   — original message ID in the source chat.
+    error_text — non-None string if extraction failed.
+
+    Supports:
+      • Messages forwarded from public/private channels  (forward_from_chat + forward_from_message_id)
+      • Messages forwarded from bots / users             (forward_from + forward_from_message_id)
     """
-    Parse a Telegram message link.
-    Returns (chat_ref, msg_id) where chat_ref is int or username str.
-    Returns None on failure.
-    """
-    if not text:
-        return None
-    m = _TG_LINK_RE.search(text.strip())
-    if not m:
-        return None
-    chat_id_raw, username, msg_id = m.group(1), m.group(2), m.group(3)
-    if chat_id_raw:
-        chat_ref = int(f"-100{chat_id_raw}")
-    else:
-        chat_ref = username
-    return chat_ref, int(msg_id)
+    if not msg.forward_date:
+        return None, None, "That is not a forwarded message. Please <b>forward</b> a message from the source bot."
+
+    msg_id = msg.forward_from_message_id  # set for channels; may be set for bots too
+
+    # ── Source is a channel / supergroup ─────────────────────────────────────
+    if msg.forward_from_chat:
+        chat = msg.forward_from_chat
+        chat_ref = chat.username if chat.username else chat.id
+        if not msg_id:
+            return None, None, (
+                "Could not read the original message ID from that forwarded message.\n\n"
+                "This usually means the source channel has forward-protection turned on. "
+                "Try forwarding through a userbot, or send the direct message link instead:\n"
+                "<code>https://t.me/c/CHAT_ID/MESSAGE_ID</code>"
+            )
+        return chat_ref, msg_id, None
+
+    # ── Source is a bot / user ────────────────────────────────────────────────
+    if msg.forward_from:
+        user = msg.forward_from
+        # Use username when available so the userbot can resolve the peer
+        chat_ref = user.username if user.username else user.id
+        if not msg_id:
+            # Telegram doesn't always expose msg_id for user/bot DM forwards.
+            # Give the user a helpful fallback.
+            name = f"@{user.username}" if user.username else str(user.id)
+            return None, None, (
+                f"Found source: <b>{name}</b>, but Telegram did not include the original "
+                f"message ID in the forward header (common for private-chat bot messages).\n\n"
+                f"Please send the message ID number directly (just the number), "
+                f"or open the message in Telegram Desktop / Web, copy its link, "
+                f"and send that link instead:\n"
+                f"<code>https://t.me/{user.username or 'c/CHATID'}/MESSAGE_ID</code>"
+            )
+        return chat_ref, msg_id, None
+
+    return None, None, (
+        "Could not identify the source chat from that forwarded message. "
+        "Make sure you forward <b>with the sender's tag</b> (do not forward anonymously)."
+    )
 
 
 def _should_forward(msg, configs):
-    """
-    Return True if this message passes the user's /settings filter configuration.
-    """
-    filters_cfg = configs.get("filters", {})
-    if msg.video       and filters_cfg.get("video",     True): return True
-    if msg.document    and filters_cfg.get("document",  True): return True
-    if msg.photo       and filters_cfg.get("photo",     True): return True
-    if msg.audio       and filters_cfg.get("audio",     True): return True
-    if msg.voice       and filters_cfg.get("voice",     True): return True
-    if msg.animation   and filters_cfg.get("animation", True): return True
-    if msg.sticker     and filters_cfg.get("sticker",   True): return True
-    if msg.text        and filters_cfg.get("text",      True): return True
+    """Return True if this message passes the user's /settings filter config."""
+    f = configs.get("filters", {})
+    if msg.video     and f.get("video",     True): return True
+    if msg.document  and f.get("document",  True): return True
+    if msg.photo     and f.get("photo",     True): return True
+    if msg.audio     and f.get("audio",     True): return True
+    if msg.voice     and f.get("voice",     True): return True
+    if msg.animation and f.get("animation", True): return True
+    if msg.sticker   and f.get("sticker",   True): return True
+    if msg.text      and f.get("text",      True): return True
     return False
 
 
-# ─── /fwd_bot command ────────────────────────────────────────────────────────
+# ─── /fwd_bot entry point ────────────────────────────────────────────────────
 
 @Client.on_message(filters.private & filters.command(["fwd_bot"]))
 async def fwd_bot_command(bot, message):
     user_id = message.from_user.id
 
-    # Require a configured bot / userbot
+    # Require configured bot / userbot
     _bot = await db.get_bot(user_id)
     if not _bot:
         return await message.reply_text(
@@ -107,69 +135,60 @@ async def fwd_bot_command(bot, message):
     else:
         toid = channels[0]["chat_id"]
 
-    # ── Ask for FIRST message link ───────────────────────────────────────────
+    # ── Ask for FIRST message (forwarded) ────────────────────────────────────
     first_ask = await bot.ask(
         message.chat.id,
-        "<b>❪ FWD BOT ❫</b>\n\n"
-        "Send the <b>first message link</b> from the bot.\n\n"
-        "<b>Format:</b>\n"
-        "• Public bot: <code>https://t.me/botusername/MESSAGE_ID</code>\n"
-        "• Private chat: <code>https://t.me/c/CHAT_ID/MESSAGE_ID</code>\n\n"
+        "<b>❪ FWD BOT — Step 1/2 ❫</b>\n\n"
+        "📩 <b>Forward the FIRST message</b> from the source bot "
+        "(forward it with the sender's tag — do <u>not</u> forward anonymously).\n\n"
         "/cancel — cancel this process",
         reply_markup=ReplyKeyboardRemove(),
     )
     if first_ask.text and first_ask.text.strip() == "/cancel":
         return await first_ask.reply("<b>Process cancelled.</b>")
 
-    parsed_first = _parse_msg_link(first_ask.text or "")
-    if not parsed_first:
-        return await first_ask.reply(
-            "<b>❌ Could not parse that link.</b>\n"
-            "Use format: <code>https://t.me/botusername/123</code>"
-        )
-    chat_ref, first_id = parsed_first
+    chat_ref, first_id, err = _extract_forward_info(first_ask)
+    if err:
+        return await first_ask.reply(f"<b>❌ {err}</b>")
 
-    # ── Ask for LAST message link ────────────────────────────────────────────
+    # ── Ask for LAST message (forwarded) ─────────────────────────────────────
     last_ask = await bot.ask(
         message.chat.id,
-        "<b>Now send the <b>last message link</b> from the same bot.</b>\n\n"
-        "<b>Format:</b>\n"
-        "• Public bot: <code>https://t.me/botusername/MESSAGE_ID</code>\n"
-        "• Private chat: <code>https://t.me/c/CHAT_ID/MESSAGE_ID</code>\n\n"
+        "<b>❪ FWD BOT — Step 2/2 ❫</b>\n\n"
+        f"✅ Got first message ID: <code>{first_id}</code> from <code>{chat_ref}</code>\n\n"
+        "📩 Now <b>forward the LAST message</b> from the same source bot.\n\n"
         "/cancel — cancel this process",
     )
     if last_ask.text and last_ask.text.strip() == "/cancel":
         return await last_ask.reply("<b>Process cancelled.</b>")
 
-    parsed_last = _parse_msg_link(last_ask.text or "")
-    if not parsed_last:
-        return await last_ask.reply(
-            "<b>❌ Could not parse that link.</b>\n"
-            "Use format: <code>https://t.me/botusername/123</code>"
-        )
-    last_chat_ref, last_id = parsed_last
+    last_chat_ref, last_id, err = _extract_forward_info(last_ask)
+    if err:
+        return await last_ask.reply(f"<b>❌ {err}</b>")
 
-    # Both links must point to the same chat
+    # Both messages must be from the same chat
     if str(chat_ref) != str(last_chat_ref):
         return await last_ask.reply(
-            "<b>❌ Both links must be from the same bot/chat.</b>"
+            f"<b>❌ Source mismatch!</b>\n"
+            f"First message is from <code>{chat_ref}</code> but "
+            f"last message is from <code>{last_chat_ref}</code>.\n"
+            f"Both must come from the same bot/chat."
         )
 
     if last_id < first_id:
-        return await last_ask.reply(
-            "<b>❌ Last message ID must be ≥ first message ID.</b>"
-        )
+        # Swap silently so order doesn't matter
+        first_id, last_id = last_id, first_id
 
     total = last_id - first_id + 1
 
-    # ── Confirmation prompt ──────────────────────────────────────────────────
+    # ── Confirmation ─────────────────────────────────────────────────────────
     confirm = await message.reply_text(
         f"<b>❪ CONFIRM FWD BOT ❫</b>\n\n"
         f"<b>Source:</b> <code>{chat_ref}</code>\n"
         f"<b>First message ID:</b> <code>{first_id}</code>\n"
-        f"<b>Last message ID:</b>  <code>{last_id}</code>\n"
+        f"<b>Last  message ID:</b> <code>{last_id}</code>\n"
         f"<b>Total IDs to scan:</b> <code>{total}</code>\n\n"
-        f"Media filters and caption will follow your <b>/settings</b> config.\n\n"
+        f"Media type & caption will follow your <b>/settings</b> config.\n\n"
         f"<b>Start forwarding?</b>",
         reply_markup=InlineKeyboardMarkup([[
             InlineKeyboardButton("✅ Yes", callback_data=f"fwdbot_yes_{user_id}"),
@@ -177,7 +196,6 @@ async def fwd_bot_command(bot, message):
         ]]),
     )
 
-    # Store job data
     temp.FWDX_JOBS[user_id] = {
         "type":     "fwd_bot",
         "chat_ref": chat_ref,
@@ -199,7 +217,6 @@ async def fwd_bot_confirm(bot, query):
         return await query.answer(
             "This confirmation has expired. Send /fwd_bot again.", show_alert=True
         )
-
     if temp.lock.get(user_id) and str(temp.lock.get(user_id)) == "True":
         return await query.answer(
             "Please wait until your previous task completes.", show_alert=True
@@ -208,8 +225,7 @@ async def fwd_bot_confirm(bot, query):
     toid = data["toid"]
     if toid in temp.IS_FRWD_CHAT:
         return await query.answer(
-            "A task is already running for this target chat. Please wait.",
-            show_alert=True,
+            "A task is already running for this target chat. Please wait.", show_alert=True
         )
 
     await query.answer()
@@ -240,11 +256,11 @@ async def fwd_bot_confirm(bot, query):
     first_id = data["first_id"]
     last_id  = data["last_id"]
 
-    configs      = await db.get_configs(user_id)
-    caption      = configs.get("caption")
-    forward_tag  = configs.get("forward_tag", False)
-    protect      = configs.get("protect", False)
-    button       = parse_buttons(configs.get("button") or "")
+    configs     = await db.get_configs(user_id)
+    caption     = configs.get("caption")
+    forward_tag = configs.get("forward_tag", False)
+    protect     = configs.get("protect", False)
+    button      = parse_buttons(configs.get("button") or "")
 
     # Mark as busy
     temp.forwardings += 1
@@ -253,8 +269,8 @@ async def fwd_bot_confirm(bot, query):
     temp.lock[user_id]   = True
     temp.CANCEL[user_id] = False
 
-    sleep = 0.5 if _bot["is_bot"] else 3
-    fetched = forwarded = skipped = deleted = 0
+    sleep    = 0.5 if _bot["is_bot"] else 3
+    fetched  = forwarded = skipped = deleted = 0
 
     async def _update_progress():
         try:
@@ -263,13 +279,14 @@ async def fwd_bot_confirm(bot, query):
                 f"<b>Source:</b> <code>{chat_ref}</code>\n"
                 f"<b>Range:</b> <code>{first_id}</code> → <code>{last_id}</code>\n\n"
                 f"Fetched: <b>{fetched}</b> | Forwarded: <b>{forwarded}</b> | "
-                f"Skipped: <b>{skipped}</b> | Deleted: <b>{deleted}</b>"
+                f"Skipped: <b>{skipped}</b> | Deleted: <b>{deleted}</b>\n\n"
+                f"<i>Use /cancel to stop.</i>"
             )
         except Exception:
             pass
 
     async def _flush_batch(batch):
-        """Forward a batch of message IDs and return how many were sent."""
+        """Forward a batch of message IDs; returns count actually sent."""
         if not batch:
             return 0
         try:
@@ -285,11 +302,11 @@ async def fwd_bot_confirm(bot, query):
             await asyncio.sleep(e.value + 1)
             return await _flush_batch(batch)
         except Exception as e:
-            logger.warning(f"fwd_bot forward error: {e}")
+            logger.warning(f"fwd_bot forward_batch error: {e}")
             return 0
 
     try:
-        MSG = []  # batch accumulator (used when no custom caption)
+        MSG = []  # batch accumulator (used in no-custom-caption mode)
 
         for chunk_start in range(first_id, last_id + 1, _CHUNK):
             if temp.CANCEL.get(user_id) is True:
@@ -320,15 +337,13 @@ async def fwd_bot_confirm(bot, query):
                     continue
 
                 if not caption:
-                    # Batch-forward mode
                     MSG.append(msg.id)
                     if len(MSG) >= 100:
                         forwarded += await _flush_batch(MSG)
                         MSG.clear()
                         await asyncio.sleep(3)
                 else:
-                    # Copy with custom caption
-                    _media = media(msg)
+                    _media   = media(msg)
                     _caption = custom_caption(msg, caption)
                     try:
                         if _media and _caption:
@@ -358,10 +373,9 @@ async def fwd_bot_confirm(bot, query):
             await _update_progress()
             await asyncio.sleep(0.35)
 
-        # Flush remaining batch
+        # Flush any remaining batch
         if MSG:
             forwarded += await _flush_batch(MSG)
-            MSG.clear()
 
     except asyncio.CancelledError:
         try:
@@ -393,7 +407,7 @@ async def fwd_bot_confirm(bot, query):
         except Exception:
             pass
 
-    # ── Cleanup ──────────────────────────────────────────────────────────────
+    # ── Cleanup ───────────────────────────────────────────────────────────────
     try:
         await client.stop()
     except Exception:
